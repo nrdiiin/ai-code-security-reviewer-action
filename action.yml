@@ -1,0 +1,174 @@
+name: "AI Code Security Reviewer"
+description: "Automated AI-powered code security scanning for your CI/CD pipeline. Finds vulnerabilities, generates SARIF reports, and posts PR comments."
+author: "Nurdin (@nrdiiin)"
+
+branding:
+  icon: "shield"
+  color: "green"
+
+inputs:
+  path:
+    description: "Directory or file path to scan"
+    required: false
+    default: "."
+  fail-on:
+    description: "Severity threshold to fail the action (critical, high, medium, low, info)"
+    required: false
+    default: "high"
+  ignore:
+    description: "Comma-separated glob patterns to exclude from scanning"
+    required: false
+    default: ""
+  comment-pr:
+    description: "Whether to post a comment on the PR with scan results"
+    required: false
+    default: "true"
+  github-token:
+    description: "GitHub token for API calls (PR comments, SARIF upload)"
+    required: false
+    default: "${{ github.token }}"
+
+outputs:
+  findings-count:
+    description: "Total number of findings from the scan"
+    value: ${{ steps.scan-json.outputs.findings-count }}
+  sarif-file:
+    description: "Path to the generated SARIF file"
+    value: ${{ steps.scan-sarif.outputs.sarif-file }}
+
+runs:
+  using: "composite"
+  steps:
+    # Step 1: Setup Python
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    # Step 2: Install CLI
+    - name: Install AI Code Security Reviewer CLI
+      shell: bash
+      run: |
+        pip install git+https://github.com/nrdiiin/ai-code-security-reviewer-cli.git
+
+    # Step 3a: Run scan with JSON output (for PR comment and findings count)
+    - name: Scan (JSON output)
+      id: scan-json
+      shell: bash
+      env:
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_IGNORE: ${{ inputs.ignore }}
+      run: |
+        JSON_FILE="results.json"
+
+        # Build ignore args (CLI uses repeated --ignore flags)
+        IGNORE_ARGS=""
+        if [ -n "$INPUT_IGNORE" ]; then
+          IFS=',' read -ra PATTERNS <<< "$INPUT_IGNORE"
+          for pattern in "${PATTERNS[@]}"; do
+            pattern=$(echo "$pattern" | xargs)  # trim whitespace
+            IGNORE_ARGS="$IGNORE_ARGS --ignore \"$pattern\""
+          done
+        fi
+
+        echo "Running: aicsr scan \"$INPUT_PATH\" --format json $IGNORE_ARGS"
+        eval aicsr scan \"$INPUT_PATH\" --format json $IGNORE_ARGS > "$JSON_FILE"
+
+        # Extract findings count from JSON
+        COUNT=$(python3 -c "import json; data=json.load(open('$JSON_FILE')); print(data.get('total', len(data.get('findings', []))))")
+        echo "findings-count=$COUNT" >> "$GITHUB_OUTPUT"
+        echo "Scan complete: $COUNT findings (JSON)"
+
+    # Step 3b: Run scan with SARIF output + capture fail-on exit code
+    # We use `set +e` so the step does NOT fail even if --fail-on triggers.
+    # The exit code is saved to $GITHUB_OUTPUT for the final gate step.
+    # This allows PR comment and SARIF upload to proceed first.
+    - name: Scan (SARIF output)
+      id: scan-sarif
+      shell: bash
+      env:
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_IGNORE: ${{ inputs.ignore }}
+      run: |
+        SARIF_FILE="results.sarif"
+
+        # Build ignore args
+        IGNORE_ARGS=""
+        if [ -n "$INPUT_IGNORE" ]; then
+          IFS=',' read -ra PATTERNS <<< "$INPUT_IGNORE"
+          for pattern in "${PATTERNS[@]}"; do
+            pattern=$(echo "$pattern" | xargs)
+            IGNORE_ARGS="$IGNORE_ARGS --ignore \"$pattern\""
+          done
+        fi
+
+        # Run scan with --fail-on, but capture the exit code instead of failing
+        set +e
+        eval aicsr scan \"$INPUT_PATH\" --format sarif --fail-on \"$INPUT_FAIL_ON\" $IGNORE_ARGS > "$SARIF_FILE"
+        SCAN_EXIT_CODE=$?
+        set -e
+
+        echo "sarif-file=$SARIF_FILE" >> "$GITHUB_OUTPUT"
+        echo "scan-exit-code=$SCAN_EXIT_CODE" >> "$GITHUB_OUTPUT"
+        echo "Scan complete (SARIF), exit code: $SCAN_EXIT_CODE"
+
+    # Step 4: Format PR comment (always runs so comment is ready even on scan failure)
+    - name: Format PR comment
+      if: always()
+      shell: bash
+      env:
+        JSON_FILE: "results.json"
+      run: |
+        if [ ! -f "$JSON_FILE" ]; then
+          echo "No JSON results file found, skipping PR comment formatting."
+          exit 0
+        fi
+        python3 "${{ github.action_path }}/scripts/format_pr_comment.py" \
+          --input "$JSON_FILE" \
+          --output pr_comment.md \
+          --repo "${{ github.repository }}"
+
+    # Step 5: Post PR comment (always runs)
+    - name: Post PR comment
+      if: always()
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        COMMENT_FILE: "pr_comment.md"
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_EVENT_NAME: ${{ github.event_name }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        if [ ! -f "$COMMENT_FILE" ]; then
+          echo "No comment file found, skipping PR comment posting."
+          exit 0
+        fi
+        python3 "${{ github.action_path }}/scripts/post_pr_comment.py" \
+          --token "$GITHUB_TOKEN" \
+          --comment-file "$COMMENT_FILE" \
+          --repo "$GITHUB_REPOSITORY" \
+          --event "$GITHUB_EVENT_NAME" \
+          --pr-number "$PR_NUMBER"
+
+    # Step 6: Upload SARIF to GitHub Code Scanning (always runs)
+    - name: Upload SARIF to Code Scanning
+      if: always()
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ steps.scan-sarif.outputs.sarif-file }}
+        token: ${{ inputs.github-token }}
+
+    # Step 7: Final gate — fail the action if scan exceeded severity threshold
+    # This runs LAST, after PR comment and SARIF upload have already completed.
+    - name: Check severity threshold
+      if: always()
+      shell: bash
+      env:
+        SCAN_EXIT_CODE: ${{ steps.scan-sarif.outputs.scan-exit-code }}
+      run: |
+        if [ "$SCAN_EXIT_CODE" != "0" ]; then
+          echo "::error::Found findings at or above the severity threshold. Failing action."
+          exit 1
+        fi
+        echo "No findings at or above threshold. Passing."
