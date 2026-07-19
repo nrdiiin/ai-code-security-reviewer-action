@@ -27,6 +27,14 @@ jobs:
 
 That's it! The action will scan your code and comment on PRs automatically.
 
+## Example Output
+
+Here's what a PR comment looks like when the action finds issues:
+
+![Example PR comment](docs/images/pr-comment-example.png)
+
+SARIF results are also uploaded to GitHub's Security tab for inline code annotations.
+
 ## Inputs
 
 | Input | Description | Default |
